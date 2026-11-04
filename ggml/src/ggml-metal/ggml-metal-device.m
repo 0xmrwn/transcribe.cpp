@@ -938,6 +938,9 @@ struct ggml_metal_rsets {
     atomic_bool d_stop;
     atomic_int  d_loop;
 
+    // signalled when the heartbeat should run again after the keep-alive ran out (or stop)
+    dispatch_semaphore_t d_wake;
+
     dispatch_group_t d_group;
 };
 
@@ -992,6 +995,7 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     atomic_store_explicit(&res->d_stop, false, memory_order_relaxed);
     atomic_store_explicit(&res->d_loop, res->loops_per_s*res->keep_alive_s, memory_order_relaxed);
 
+    res->d_wake  = dispatch_semaphore_create(0);
     res->d_group = dispatch_group_create();
 
     // start a background thread that periodically requests residency for all the currently active sets in the collection
@@ -1011,6 +1015,11 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
                       atomic_fetch_sub_explicit(&res->d_loop, 1, memory_order_relaxed);
 
                       [res->lock unlock];
+                  } else {
+                      // the keep-alive ran out: sleep until the next graph computation (or stop)
+                      // instead of waking every time_per_loop_ms for nothing
+                      dispatch_semaphore_wait(res->d_wake, DISPATCH_TIME_FOREVER);
+                      continue;
                   }
 
                   usleep(res->time_per_loop_ms * 1000);
@@ -1040,9 +1049,11 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
     GGML_ASSERT([rsets->data count] == 0);
 
     atomic_store_explicit(&rsets->d_stop, true, memory_order_relaxed);
+    dispatch_semaphore_signal(rsets->d_wake);
 
     dispatch_group_wait(rsets->d_group, DISPATCH_TIME_FOREVER);
     dispatch_release(rsets->d_group);
+    dispatch_release(rsets->d_wake);
 
     [rsets->data release];
     [rsets->lock release];
@@ -1440,7 +1451,11 @@ void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev) {
         return;
     }
 
-    atomic_store_explicit(&dev->rsets->d_loop, dev->rsets->loops_per_s*dev->rsets->keep_alive_s, memory_order_relaxed);
+    const int prev = atomic_exchange_explicit(&dev->rsets->d_loop, dev->rsets->loops_per_s*dev->rsets->keep_alive_s, memory_order_relaxed);
+    if (prev <= 0) {
+        // the heartbeat may be asleep: wake it
+        dispatch_semaphore_signal(dev->rsets->d_wake);
+    }
 }
 
 struct ggml_metal_event {
