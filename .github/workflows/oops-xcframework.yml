@@ -1,0 +1,37 @@
+name: oops-xcframework
+
+# Builds the macOS xcframework that Oops links against and attaches it to a release.
+# Runs on `oops-*` tags only, so upstream's own release workflow (v* tags) is untouched.
+on:
+  push:
+    tags: ["oops-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the macOS slice
+        run: TRANSCRIBE_XCFRAMEWORK_SLICES=macos scripts/ci/build_xcframework.sh
+
+      - name: Package with licences
+        id: package
+        run: |
+          scripts/ci/package_xcframework.sh | tee package.log
+          echo "checksum=$(sed -n 's/^checksum: //p' package.log)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            bindings/swift/build-apple/TranscribeCpp.xcframework.zip \
+            --title "$GITHUB_REF_NAME" \
+            --notes "macOS xcframework (arm64 with Metal, x86_64 CPU-only) built from ${GITHUB_SHA}. SwiftPM checksum: ${CHECKSUM}"
